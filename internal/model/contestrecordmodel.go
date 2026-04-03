@@ -16,6 +16,8 @@ type (
 		Upsert(ctx context.Context, data *ContestRecord) error
 		// FindByStudent 查询某用户的全部比赛历史。
 		FindByStudent(ctx context.Context, studentID string) ([]*ContestRecord, error)
+		// FindByStudent 查询某比赛的用户排名
+		FindByContest(ctx context.Context, platform, contestID string) ([]*ContestRecord, error)
 		// FindRecent 查询某用户最近 N 天的比赛记录。
 		FindRecent(ctx context.Context, studentID string, days int) ([]*ContestRecord, error)
 		// Delete 删除某场比赛记录。
@@ -69,15 +71,16 @@ func (m *defaultContestRecord) Upsert(
 				{Name: "platform"},
 				{Name: "contest_id"},
 			},
-			DoUpdates: clause.AssignmentColumns([]string{
-				"contest_name",
-				"contest_date",
-				"contest_rank",
-				"old_rating",
-				"new_rating",
-				"rating_change",
-				"performance",
-				"created_at",
+			DoUpdates: clause.Assignments(map[string]any{
+				"contest_name":  data.ContestName,
+				"contest_date":  data.ContestDate,
+				"contest_rank":  data.ContestRank,
+				"old_rating":    data.OldRating,
+				"new_rating":    data.NewRating,
+				"rating_change": data.RatingChange,
+				"performance":   data.Performance,
+				"created_at":    data.CreatedAt,
+				"deleted_at":    nil,
 			}),
 		}).
 		Create(data).Error
@@ -108,6 +111,7 @@ func (m *defaultContestRecord) Delete(
 ) error {
 
 	return m.model().
+		Unscoped().
 		Where("student_id = ? AND platform = ? AND contest_id = ?",
 			studentID, platform, contestID).
 		Delete(&ContestRecord{}).Error
@@ -121,6 +125,7 @@ func (m *defaultContestRecord) DeleteRange(
 
 	tx := m.model().
 		WithContext(ctx).
+		Unscoped().
 		Where("contest_date BETWEEN ? AND ?", from, to)
 
 	if len(studentIDs) > 0 {
@@ -128,4 +133,17 @@ func (m *defaultContestRecord) DeleteRange(
 	}
 
 	return tx.Delete(&ContestRecord{}).Error
+}
+
+func (m *defaultContestRecord) FindByContest(
+	ctx context.Context,
+	platform, contestID string,
+) ([]*ContestRecord, error) {
+	var list []*ContestRecord
+	err := m.model().
+		WithContext(ctx).
+		Where("platform = ? AND contest_id = ?", platform, contestID).
+		Order("contest_rank ASC").
+		Find(&list).Error
+	return list, err
 }

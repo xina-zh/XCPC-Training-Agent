@@ -3,8 +3,10 @@ package svc
 import (
 	"aATA/internal/config"
 	"aATA/internal/crawler"
-	"aATA/internal/llm"
-	"aATA/internal/logic/agent"
+	applogic "aATA/internal/logic"
+	anomalylogic "aATA/internal/logic/anomaly"
+	agentllm "aATA/internal/logic/agent/llm"
+	"aATA/internal/logic/agent/tooling"
 	"aATA/internal/logic/agent/tools"
 	"aATA/internal/middleware"
 	"aATA/internal/model"
@@ -12,79 +14,149 @@ import (
 	"aATA/pkg/jwt"
 	"context"
 	"errors"
+	"os"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
+// Models 收拢所有数据库模型依赖。
+// 采用嵌入方式是为了在 ServiceContext 上继续保持短字段访问。
+type Models struct {
+	UsersModel            model.UsersModel
+	ContestModel          model.ContestRecordModel
+	DailyModel            model.DailyTrainingStatsModel
+	StudentSyncStateModel model.StudentSyncStateModel
+	TrainingAlertModel    model.TrainingAlertModel
+	AnomalyRuleConfigModel model.AnomalyRuleConfigModel
+}
+
+// Infra 收拢与业务无关的基础设施依赖。
+type Infra struct {
+	JWT     *jwt.JWT
+	Crawler crawler.Crawler
+}
+
+// MiddlewareSet 收拢 HTTP 中间件依赖。
+type MiddlewareSet struct {
+	JwtMid     *middleware.JWTMid
+	AdminMid   *middleware.AdminMid
+	LoggingMid *middleware.LoggingMid
+}
+
+// AgentDeps 收拢 Agent 模块运行所需的依赖。
+type AgentDeps struct {
+	LLMClient agentllm.Client
+
+	TrainingSummaryTool          tooling.Tool
+	StudentContestRecordsTool    tooling.Tool
+	TrainingValueLeaderboardTool tooling.Tool
+	ContestRankingTool           tooling.Tool
+	TrainingAlertsTool           tooling.Tool
+}
+
+type AnomalyDeps struct {
+	AnomalyService anomalylogic.Service
+}
+
+// ServiceContext 是应用层依赖的轻量装配入口。
+// 这里按领域分组依赖，但通过嵌入保持原有访问方式不变。
 type ServiceContext struct {
 	Config config.Config
 	ctx    context.Context
 
-	// 基础设施
-	JWT                      *jwt.JWT
-	UsersModel               model.UsersModel
-	ContestModel             model.ContestRecordModel
-	DailyModel               model.DailyTrainingStatsModel
-	Crawler                  crawler.Crawler
-	LLMClient                llm.Client
-	GetUserTrainingRangeTool agent.Tool
-
-	// Middleware
-	JwtMid     *middleware.JWTMid
-	AdminMid   *middleware.AdminMid
-	LoggingMid *middleware.LoggingMid
-
-	// AgentTools
-	TrainingSummaryTool      agent.Tool
-	ContestRatingSummaryTool agent.Tool
+	Models
+	Infra
+	MiddlewareSet
+	AgentDeps
+	AnomalyDeps
 }
 
 func NewServiceContext(ctx context.Context, c config.Config) (*ServiceContext, error) {
-	db, err := gorm.Open(mysql.Open(c.MySql.DataSource), &gorm.Config{}) // 这就是进行组装了
+	db, err := gorm.Open(mysql.Open(c.MySql.DataSource), &gorm.Config{})
 	if err != nil {
 		return nil, err
 	}
 
-	// 统一拼装 model
-	dailyModel := model.NewDailyTrainingStatsModel(db)
-	userModel := model.NewUsersModel(db)
-	contestModel := model.NewContestRecordModel(db)
-
-	jwtTool := jwt.NewJWT(
-		c.JWT.Secret,
-		c.JWT.Expire,
-	)
-
-	craw := &crawler.PythonCrawler{
-		ScriptPath: "./internal/crawler/crawler_cli.py",
-		PythonBin:  "python3",
-	}
-
-	// 拼装 agent 工具
-	llmClient := llm.NewAliyunQwenClient("glm-4.7")
-	TrainingSummaryTool := tools.NewTrainingSummaryTool(dailyModel)
-	ContestRatingSummaryTool := tools.NewContestRatingSummaryTool(contestModel)
+	models := newModels(db)
+	infra := newInfra(c)
+	middlewareSet := newMiddlewareSet(infra.JWT)
+	agentDeps := newAgentDeps(models)
+	anomalyDeps := newAnomalyDeps(models)
 
 	res := &ServiceContext{
-		ctx:          ctx,
-		Config:       c,
-		UsersModel:   userModel,
-		ContestModel: contestModel,
-		DailyModel:   dailyModel,
-
-		JWT:        jwtTool,
-		JwtMid:     middleware.NewJWTMid(jwtTool),
-		LoggingMid: middleware.NewLoggingMid(),
-		AdminMid:   middleware.NewAdminMid(),
-
-		Crawler:                  craw,
-		LLMClient:                llmClient,
-		TrainingSummaryTool:      TrainingSummaryTool,
-		ContestRatingSummaryTool: ContestRatingSummaryTool,
+		ctx:           ctx,
+		Config:        c,
+		Models:        models,
+		Infra:         infra,
+		MiddlewareSet: middlewareSet,
+		AgentDeps:     agentDeps,
+		AnomalyDeps:   anomalyDeps,
 	}
 
 	return res, initServer(res)
+}
+
+func newModels(db *gorm.DB) Models {
+	return Models{
+		UsersModel:            model.NewUsersModel(db),
+		ContestModel:          model.NewContestRecordModel(db),
+		DailyModel:            model.NewDailyTrainingStatsModel(db),
+		StudentSyncStateModel: model.NewStudentSyncStateModel(db),
+		TrainingAlertModel:    model.NewTrainingAlertModel(db),
+		AnomalyRuleConfigModel: model.NewAnomalyRuleConfigModel(db),
+	}
+}
+
+func newInfra(c config.Config) Infra {
+	return Infra{
+		JWT: jwt.NewJWT(c.JWT.Secret, c.JWT.Expire),
+		Crawler: &crawler.PythonCrawler{
+			ScriptPath: "./internal/crawler/crawler_cli.py",
+			PythonBin:  "python3",
+		},
+	}
+}
+
+func newMiddlewareSet(jwtTool *jwt.JWT) MiddlewareSet {
+	return MiddlewareSet{
+		JwtMid:     middleware.NewJWTMid(jwtTool),
+		AdminMid:   middleware.NewAdminMid(),
+		LoggingMid: middleware.NewLoggingMid(),
+	}
+}
+
+func newAgentDeps(models Models) AgentDeps {
+	modelName := os.Getenv("LLM_MODEL")
+	if modelName == "" {
+		modelName = "deepseek-chat"
+	}
+	leaderboardLogic := applogic.NewTrainingLeaderboard(
+		models.UsersModel,
+		models.DailyModel,
+		models.ContestModel,
+	)
+
+	return AgentDeps{
+		LLMClient:                    agentllm.NewOpenAICompatibleClient(modelName),
+		TrainingSummaryTool:          tools.NewTrainingSummaryTool(models.DailyModel, models.ContestModel),
+		StudentContestRecordsTool:    tools.NewStudentContestRecordsTool(models.ContestModel),
+		TrainingValueLeaderboardTool: tools.NewTrainingValueLeaderboardTool(leaderboardLogic),
+		ContestRankingTool:           tools.NewContestRankingTool(models.ContestModel, models.UsersModel),
+		TrainingAlertsTool:           tools.NewTrainingAlertsTool(models.TrainingAlertModel),
+	}
+}
+
+func newAnomalyDeps(models Models) AnomalyDeps {
+	return AnomalyDeps{
+		AnomalyService: anomalylogic.New(
+			models.UsersModel,
+			models.DailyModel,
+			models.ContestModel,
+			models.TrainingAlertModel,
+			models.AnomalyRuleConfigModel,
+		),
+	}
 }
 
 func initServer(svc *ServiceContext) error {
